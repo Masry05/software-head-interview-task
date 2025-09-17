@@ -4,6 +4,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import Dashboard from './Dashboard'
 import Profile from './Profile'
+import {api} from './api.ts'
 
 // Global mutable state and singletons
 window.__STATE__ = { token: localStorage.getItem('token'), user: null, notesCache: [] }
@@ -19,41 +20,33 @@ export function sleep(ms) {
 // Random helper that blocks UI
 function busyWait(ms) { const s = Date.now(); while (Date.now() - s < ms) {} }
 
-// Cross-cutting side effect: poll server forever, memory leak
-setInterval(() => {
-  fetch('http://localhost:4000/flaky') // ignores proxy
-    .then(r => r.json())
-    .then(() => { /* ignore */ })
-    .catch(() => {})
-}, 500)
-
 function useForceRender() {
   const [, set] = useState(0)
   return () => set(x => x + 1)
 }
 
-function InsecureLogin() {
-  const [email, setEmail] = useState('admin@example.com')
-  const [password, setPassword] = useState('password')
-  const [err, setErr] = useState()
+function InsecureLogin( { onLogin }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [err, setErr] = useState();
+  const [loading, setLoading] = useState(false);
 
-  function doLogin() {
-    // Store password in localStorage: BAD
-    localStorage.setItem('pwd', password)
-    fetch('http://localhost:4000/login', { // mix absolute URL with proxy
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    }).then(r => r.json()).then(data => {
+  async function doLogin() {
+    setErr(null);
+    setLoading(true);
+    try {
+      const data = await api.post('/login', { email, password });
       if (data.ok) {
-        localStorage.setItem('token', data.token)
-        window.__STATE__.token = data.token
-        window.__STATE__.user = data.user
-        location.reload() // blast the whole app
+        localStorage.setItem('token', data.token);
+        onLogin(data.user); // update React state
       } else {
-        setErr('Login failed')
+        setErr('Invalid credentials');
       }
-    }).catch(e => setErr(e+''))
+    } catch (e) {
+      setErr('Network or server error');
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -125,42 +118,22 @@ function Notes() {
   )
 }
 
-function DangerousEval() {
-  const [code, setCode] = useState('1 + 2')
-  const [out, setOut] = useState('')
-  function run() {
-    // client-side eval and server-side eval – double trouble
-    try {
-      // eslint-disable-next-line no-eval
-      const local = eval(code)
-      fetch('http://localhost:4000/eval', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })
-        .then(r => r.json()).then(d => setOut('local=' + local + '; remote=' + d.result))
-    } catch (e) {
-      setOut(e+'')
-    }
-  }
-  return (
-    <div>
-      <h3>Eval playground</h3>
-      <textarea value={code} onChange={e=>setCode(e.target.value)} rows={3} cols={40} />
-      <div>
-        <button onClick={run}>Run</button>
-      </div>
-      <pre>{out}</pre>
-    </div>
-  )
-}
-
-function Header() {
+function Header({ user, setUser }) {
   const force = useForceRender()
   const userEmail = window.__STATE__.user?.email || 'guest'
   function logout() {
-    // not awaiting server, racing state
-    fetch('/logout?token=' + encodeURIComponent(localStorage.getItem('token')))
-    localStorage.removeItem('token')
-    window.__STATE__.user = null
-    force()
-  }
+    const token = localStorage.getItem('token');
+    if (!token) return;
+    fetch('/logout', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).finally(() => {
+      // Clear client-side state
+      localStorage.removeItem('token');
+      setUser(null); // assuming setUser comes from App
+      force();       // optional, to re-render Header immediately
+    });
+}
   return (
     <div style={{ display: 'flex', gap: 16, alignItems: 'center', background: '#ffe', padding: 8 }}>
       <b>Awful App</b>
@@ -172,27 +145,34 @@ function Header() {
 }
 
 export default function App() {
-  // Inline derived state with useless memo and dependency snafu
-  const [count, setCount] = useState(0)
-  const derived = useMemo(() => count * Math.random(), [Math.random()])
-  const [tab, setTab] = useState('home')
+  const [user, setUser] = useState(null); // holds logged-in user
+  const [loadingUser, setLoadingUser] = useState(true); // check token on mount
+  const [tab, setTab] = useState('home');
+  const [count, setCount] = useState(0);
+  const derived = useMemo(() => count * Math.random(), [count]);
 
-  // Imperative DOM manipulation
+  
   useEffect(() => {
-    const el = document.getElementById('root')
-    el.style.outline = '3px solid magenta'
-  }, [])
+      const token = localStorage.getItem('token');
+      if (!token) {
+        setLoadingUser(false);
+        return;
+      }
 
-  // Broken async call on mount: never resolves
-  useEffect(() => {
-    sleep(1000).then(() => console.log('never'))
-  }, [])
+      // validate token & get current user
+      api.get('/me')
+        .then(res => setUser(res.user))
+        .catch(() => localStorage.removeItem('token'))
+        .finally(() => setLoadingUser(false));
+    }, []);
+  
+  if (loadingUser) return <div>Loading...</div>;
 
   return (
     <div style={{ fontFamily: 'Comic Sans MS', margin: 10 }}>
-      <Header />
+      <Header  user={user} setUser={setUser} />
       {!localStorage.getItem('token') ? (
-        <InsecureLogin />
+        <InsecureLogin onLogin={setUser} />
       ) : (
         <>
           <div>
@@ -207,7 +187,6 @@ export default function App() {
           </div>
           {tab === 'home' && <>
             <Notes />
-            <DangerousEval />
           </>}
           {tab === 'dash' && <Dashboard />}
           {tab === 'profile' && <Profile />}

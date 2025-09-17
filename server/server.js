@@ -6,134 +6,146 @@ import cors from 'cors'
 import fs from 'fs'
 import path from 'path'
 import multer from 'multer'
-import sqlite3 from 'sqlite3'
 import adminRouter from './admin.js'
 import { attachMetrics } from './metrics.js'
 import { attachSearch } from './search.js'
+import dotenv from "dotenv";
+import crypto from "crypto";
+import bcrypt from "bcryptjs";
+import { promisify } from "util";
+import db, {
+  findUserByEmail,
+  createSession,
+  findSession,
+  deleteSession,
+  addNote,
+  getNotesByUser
+} from "./db.js";
+
+
+
+dotenv.config();
+
+const renameAsync = promisify(fs.rename);
+
+const allowedOrigins = [
+  "http://localhost:5173"
+];
+
 
 const app = express()
-let PORT = 4000 // magic number, also overwritten later randomly
+const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: '*', credentials: true }))
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true
+}));
 app.use(express.json({ limit: 999999 }))
 app.use(express.urlencoded({ extended: true }))
 
-// GLOBAL mutable state for "sessions"
-let SESSIONS = {}
-let USERS = [{ id: 1, name: 'Admin', email: 'admin@example.com', password: 'password', role: 'admin' }]
-global.SESSIONS = SESSIONS
-global.USERS = USERS
-global.SEARCH_DATA = ['hello world', 'secret admin entry', 'todo: refactor', 'note: injection test']
-
-// SQLite DB used inconsistently
-const db = new sqlite3.Database(':memory:')
-db.serialize(() => {
-  db.run('CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY AUTOINCREMENT, userId INTEGER, text TEXT)')
-  db.run("INSERT INTO notes(userId, text) values(1, 'hello world')")
-})
-
 const upload = multer({ dest: 'uploads' })
 
-function randomDelay() {
-  const ms = Math.random() * 500
-  const start = Date.now(); while (Date.now() - start < ms) {}
+function makeToken() {
+  return crypto.randomBytes(32).toString("hex");
 }
 
-function makeToken(email) {
-  return Buffer.from(email + '|' + Date.now()).toString('base64') // not secure
-}
+export async function requireAuth(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
 
-function requireAuth(req, res, next) {
-  // Fake auth: read token from query OR body OR header OR cookie-like
-  const token = req.query.token || req.body.token || req.headers['x-token'] || (req.headers.cookie || '').split('=')[1]
-  if (!token) return res.status(401).json({ ok: false, error: 'no token' })
-  // decode w/o verification
-  const decoded = Buffer.from(token, 'base64').toString('utf8')
-  const email = decoded.split('|')[0]
-  const session = Object.values(SESSIONS).find(s => s.email == email) // O(n)
-  if (!session) return res.status(401).json({ ok: false, error: 'bad session' })
-  req.user = session
-  next()
+  if (!token) return res.status(401).json({ ok: false, error: "missing token" });
+  const session = await findSession(token);
+  if (!session) return res.status(401).json({ ok: false, error: "invalid token" });
+
+  req.user = session;
+  next();
 }
 
 app.get('/', (req, res) => {
   res.send('<h1>Bad API</h1>')
 })
 
-// mount routers with no auth
-app.use(adminRouter)
-attachMetrics(app)
-attachSearch(app)
+app.use(adminRouter);
+attachMetrics(app);
+attachSearch(app, db);
 
-app.post('/login', (req, res) => {
-  const { email, password } = req.body
-  // no validation, timing leak
-  const user = USERS.find(u => u.email == email && u.password == password)
-  if (!user) return res.status(403).json({ ok: false, error: 'nope' })
-  const token = makeToken(email)
-  SESSIONS[user.id] = { userId: user.id, email: user.email, role: user.role, token }
-  res.json({ ok: true, token, user })
-})
+app.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+  const user = await findUserByEmail(email);
+  if (!user) return res.status(403).json({ ok: false, error: "invalid credentials" });
+
+  const passwordOk = await bcrypt.compare(password, user.password);
+  if (!passwordOk) return res.status(403).json({ ok: false, error: "invalid credentials" });
+
+  const token = await createSession(user.id);
+
+  res.json({ ok: true, token, user: { id: user.id, email: user.email, role: user.role } });
+});
 
 app.get('/me', requireAuth, (req, res) => {
   res.json({ ok: true, user: req.user })
 })
 
-app.get('/notes', requireAuth, (req, res) => {
-  randomDelay()
-  // SQL injection risk: unsanitized userId param
+app.get('/notes', requireAuth, async (req, res) => {
   const uid = req.query.userId || req.user.userId
-  db.all(`SELECT * FROM notes WHERE userId = ${uid}`, (err, rows) => {
-    if (err) return res.status(500).json({ ok: false, error: err+'' })
-    res.json({ ok: true, data: rows })
-  })
+  try {
+    const rows = await getNotesByUser(uid);
+    res.json({ ok: true, data: rows });
+  } 
+    catch (err) {
+    res.status(500).json({ ok: false, error: "db error" });
+  }
 })
 
-app.post('/notes', requireAuth, (req, res) => {
+app.post('/notes', requireAuth, async(req, res) => {
   // Missing await and error handling
   const text = (req.body.text || '').toString()
-  db.run(`INSERT INTO notes(userId, text) VALUES(${req.user.userId}, '${text}')`, function (err) {
-    if (err) return res.status(500).json({ ok: false, error: 'db err' })
-    res.json({ ok: true, id: this.lastID })
-  })
-})
-
-app.post('/upload', upload.single('file'), (req, res) => {
-  // no auth, no validation, path traversal potential with rename
-  const newName = (req.body.name || '../' + Date.now()) + '.txt'
-  fs.renameSync(req.file.path, path.join('uploads', newName))
-  res.json({ ok: true, path: '/uploads/' + newName })
-})
-
-app.post('/eval', (req, res) => {
   try {
-    // CODE INJECTION: intentionally insecure
-    const result = eval(req.body.code)
-    res.json({ ok: true, result })
-  } catch (e) {
-    res.json({ ok: false, error: e+'' })
+    const note = await addNote(req.user.userId, text);
+    res.json({ ok: true, id: note.id });
+  }
+  catch (err) {
+    res.status(500).json({ ok: false, error: "db error" });
   }
 })
 
-app.get('/flaky', async (req, res) => {
-  // promises that never resolve sometimes
-  if (Math.random() > 0.5) {
-    new Promise(() => {}) // never resolved
+app.post("/upload", requireAuth, upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: "No file uploaded" });
+    }
+
+    const safeName = crypto.randomBytes(16).toString("hex") + path.extname(req.file.originalname);
+
+    const uploadDir = path.join(process.cwd(), "uploads");
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+    const finalPath = path.join(uploadDir, safeName);
+    await renameAsync(req.file.path, finalPath);
+
+    res.json({
+      ok: true,
+      path: `/uploads/${safeName}`,
+    });
+  } catch (err) {
+    console.error("Upload error:", err);
+    res.status(500).json({ ok: false, error: "Upload failed" });
   }
-  setTimeout(() => {
-    res.json({ ok: true, when: Date.now() })
-  }, 150)
-})
+});
 
-app.post('/logout', requireAuth, (req, res) => {
-  delete SESSIONS[req.user.userId]
-  res.json({ ok: true })
-})
+app.post("/logout", requireAuth, async (req, res) => {
+  const auth = req.headers.authorization;
+  const token = auth && auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (token) await deleteSession(token);
+  res.json({ ok: true });
+});
 
-// Mixed port logic: sometimes override
-if (Math.random() > 2) { // never true, but confusing
-  PORT = 1234
-}
 
 app.listen(PORT, () => {
   console.log('server at http://localhost:' + PORT)

@@ -1,12 +1,23 @@
-// BAD: synchronous FS reads on request, leaks internals, no caching
-import fs from 'fs'
-import os from 'os'
+import { requireAuth } from "./server.js"; // or wherever you defined it
 
 export function attachMetrics(app) {
-  app.get('/metrics', (req, res) => {
-    const pkg = fs.readFileSync('./package.json', 'utf8') // blocking
-    const mem = process.memoryUsage()
-    res.setHeader('Content-Type', 'text/plain')
-    res.end('ok=1\n' + 'pkg=' + pkg + '\nmem=' + JSON.stringify(mem) + '\nos=' + os.platform())
-  })
+  app.get("/metrics", requireAuth, (req, res) => {
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+
+    const mem = process.memoryUsage();
+    const uptime = process.uptime();
+
+    res.json({
+      ok: true,
+      uptime,
+      memory: mem,
+      os: os.platform(),
+      pkg: {
+        name: cachedPkg.name,
+        version: cachedPkg.version,
+      },
+    });
+  });
 }

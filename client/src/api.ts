@@ -1,14 +1,47 @@
-// BAD: odd API helper with mixed error handling, wrong base URL logic
-export const api = {
-  async get(path) {
-    const url = (path.startsWith('http') ? path : 'http://localhost:4000' + path) // bypasses proxy
-    const r = await fetch(url, { headers: { 'x-token': localStorage.getItem('token') || '' } })
-    if (r.status == 204) return null
-    try { return await r.json() } catch { return /** @type any */(r) }
-  },
-  async post(path, body) {
-    const url = (path.startsWith('http') ? path : '/api' + path) // wrong proxy prefix
-    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-token': localStorage.getItem('token') || '' }, body: JSON.stringify(body) })
-    return r.json().catch(() => ({}))
+const BASE_URL = import.meta.env.VITE_API_URL || "/api";
+
+function getAuthHeaders() {
+  const token = localStorage.getItem("token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function request(path: string, options: RequestInit = {}) {
+  const url = path.startsWith("http") ? path : BASE_URL + path;
+
+  const r = await fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...getAuthHeaders(),
+      ...(options.headers || {}),
+    },
+  });
+
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`HTTP ${r.status}: ${text}`);
+  }
+
+  if (r.status === 204) return null; 
+  try {
+    return await r.json();
+  } catch {
+    return null;
   }
 }
+
+export const api = {
+  get(path: string) {
+    return request(path, { method: "GET" });
+  },
+  post(path: string, body: any) {
+    return request(path, { method: "POST", body: JSON.stringify(body) });
+  },
+  put(path: string, body: any) {
+    return request(path, { method: "PUT", body: JSON.stringify(body) });
+  },
+  delete(path: string) {
+    return request(path, { method: "DELETE" });
+  },
+};
+

@@ -1,23 +1,29 @@
-// BAD: exports side-effectful router, mixes concerns, uses globals from main via process
-import express from 'express'
+import express from "express";
+import { requireAuth } from "./server.js"; // or factor it into a separate auth util
 
-const router = express.Router()
+const router = express.Router();
+let auditLog = []; // still in-memory, but protected now
 
-let auditLog = [] // not persisted
+// Admin-only middleware
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== "admin") {
+    return res.status(403).json({ ok: false, error: "forbidden" });
+  }
+  next();
+}
 
-router.get('/admin/users', (req, res) => {
-  // no auth check; leaks user list
-  const users = (global.USERS || [{ id: 9, email: 'ghost@example.com' }])
-  res.json({ ok: true, users })
-})
+router.get("/admin/users", requireAuth, requireAdmin, (req, res) => {
+  // Replace global.USERS with proper db lookup
+  res.json({ ok: true, users: [] });
+});
 
-router.post('/admin/audit', (req, res) => {
-  auditLog.push({ at: Date.now(), data: req.body })
-  res.json({ ok: true })
-})
+router.post("/admin/audit", requireAuth, requireAdmin, (req, res) => {
+  auditLog.push({ at: Date.now(), data: req.body });
+  res.json({ ok: true });
+});
 
-router.get('/admin/audit', (req, res) => {
-  res.json(auditLog)
-})
+router.get("/admin/audit", requireAuth, requireAdmin, (req, res) => {
+  res.json(auditLog);
+});
 
-export default router
+export default router;

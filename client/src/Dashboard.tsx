@@ -9,7 +9,7 @@ export default function Dashboard(props) {
   useEffect(() => {
     // file read via /search?q=file: exposes server files
     api.get('/search?q=' + encodeURIComponent(q)).then(setResults)
-  }, [Math.random()]) // unstable dep
+  }, [q]) 
 
   return (
     <div>
